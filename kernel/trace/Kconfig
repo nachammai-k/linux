@@ -592,6 +592,13 @@ config FTRACE_MCOUNT_RECORD
 	depends on DYNAMIC_FTRACE
 	depends on HAVE_FTRACE_MCOUNT_RECORD
 
+config TRACE_EVENTS_TO_PSTORE
+	bool "Enable users to store trace records in persistent storage"
+	default n
+	help
+	  This option enables tracing users to store trace records in 
+	  persistent storage so that they can be retrieved after system reboot.
+
 config FTRACE_SELFTEST
 	bool
 

@@ -195,6 +195,9 @@ void ring_buffer_free_read_page(struct ring_buffer *buffer, int cpu, void *data)
 int ring_buffer_read_page(struct ring_buffer *buffer, void **data_page,
 			  size_t len, int cpu, int full);
 
+int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, 
+				      const char *name, int clock_id);
+
 struct trace_seq;
 
 int ring_buffer_print_entry_header(struct trace_seq *s);

@@ -25,7 +25,7 @@
 #include <linux/list.h>
 #include <linux/cpu.h>
 #include <linux/oom.h>
-
+#include <linux/ramtrace.h>
 #include <asm/local.h>
 
 static void update_pages_handler(struct work_struct *work);
@@ -355,6 +355,17 @@ static void free_buffer_page(struct buffer_page *bpage)
 	kfree(bpage);
 }
 
+static void free_buffer_page_cpu(struct buffer_page *bpage, int cpu, bool persist)
+{
+	if (persist)
+	{
+		ramtrace_free_page((unsigned long)bpage->page, cpu);
+		kfree(bpage);
+	}
+	else
+		free_buffer_page(bpage);
+}
+
 /*
  * We need to fit the time_stamp delta into 27 bits.
  */
@@ -480,6 +491,7 @@ struct ring_buffer_per_cpu {
 	struct completion		update_done;
 
 	struct rb_irq_work		irq_work;
+	bool				persist;
 };
 
 struct ring_buffer {
@@ -1186,7 +1198,12 @@ static int rb_check_pages(struct ring_buffer_per_cpu *cpu_buffer)
 	return 0;
 }
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+static int __rb_allocate_pages(long nr_pages, struct list_head *pages, int cpu,
+				bool persist)
+#else
 static int __rb_allocate_pages(long nr_pages, struct list_head *pages, int cpu)
+#endif	
 {
 	struct buffer_page *bpage, *tmp;
 	bool user_thread = current->mm != NULL;
@@ -1232,6 +1249,11 @@ static int __rb_allocate_pages(long nr_pages, struct list_head *pages, int cpu)
 
 		list_add(&bpage->list, pages);
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+		if (persist)
+			page = ramtrace_alloc_page(cpu);
+		else
+#endif		
 		page = alloc_pages_node(cpu_to_node(cpu), mflags, 0);
 		if (!page)
 			goto free_pages;
@@ -1249,7 +1271,11 @@ static int __rb_allocate_pages(long nr_pages, struct list_head *pages, int cpu)
 free_pages:
 	list_for_each_entry_safe(bpage, tmp, pages, list) {
 		list_del_init(&bpage->list);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+		free_buffer_page_cpu(bpage, cpu, persist);
+#else		
 		free_buffer_page(bpage);
+#endif		
 	}
 	if (user_thread)
 		clear_current_oom_origin();
@@ -1264,7 +1290,11 @@ static int rb_allocate_pages(struct ring_buffer_per_cpu *cpu_buffer,
 
 	WARN_ON(!nr_pages);
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+	if (__rb_allocate_pages(nr_pages, &pages, cpu_buffer->cpu, cpu_buffer->persist))
+#else
 	if (__rb_allocate_pages(nr_pages, &pages, cpu_buffer->cpu))
+#endif
 		return -ENOMEM;
 
 	/*
@@ -1314,6 +1344,12 @@ rb_allocate_cpu_buffer(struct ring_buffer *buffer, long nr_pages, int cpu)
 	rb_check_bpage(cpu_buffer, bpage);
 
 	cpu_buffer->reader_page = bpage;
+	
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+	if (cpu_buffer->persist)
+		page = ramtrace_alloc_page(cpu);
+	else
+#endif		
 	page = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL, 0);
 	if (!page)
 		goto fail_free_reader;
@@ -1336,7 +1372,11 @@ rb_allocate_cpu_buffer(struct ring_buffer *buffer, long nr_pages, int cpu)
 	return cpu_buffer;
 
  fail_free_reader:
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+	free_buffer_page_cpu(cpu_buffer->reader_page, cpu, cpu_buffer->persist);
+#else		
 	free_buffer_page(cpu_buffer->reader_page);
+#endif
 
  fail_free_buffer:
 	kfree(cpu_buffer);
@@ -1348,17 +1388,29 @@ static void rb_free_cpu_buffer(struct ring_buffer_per_cpu *cpu_buffer)
 	struct list_head *head = cpu_buffer->pages;
 	struct buffer_page *bpage, *tmp;
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+	free_buffer_page_cpu(cpu_buffer->reader_page, cpu_buffer->cpu, cpu_buffer->persist);
+#else		
 	free_buffer_page(cpu_buffer->reader_page);
+#endif
 
 	rb_head_page_deactivate(cpu_buffer);
 
 	if (head) {
 		list_for_each_entry_safe(bpage, tmp, head, list) {
 			list_del_init(&bpage->list);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+			free_buffer_page_cpu(bpage, cpu_buffer->cpu, cpu_buffer->persist);
+#else		
 			free_buffer_page(bpage);
+#endif			
 		}
 		bpage = list_entry(head, struct buffer_page, list);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+		free_buffer_page_cpu(bpage, cpu_buffer->cpu, cpu_buffer->persist);
+#else		
 		free_buffer_page(bpage);
+#endif		
 	}
 
 	kfree(cpu_buffer);
@@ -1413,6 +1465,7 @@ struct ring_buffer *__ring_buffer_alloc(unsigned long size, unsigned flags,
 		goto fail_free_cpumask;
 
 	cpu = raw_smp_processor_id();
+	pr_info("cpu %d init trace alloc buffer \n" ,cpu);
 	cpumask_set_cpu(cpu, buffer->cpumask);
 	buffer->buffers[cpu] = rb_allocate_cpu_buffer(buffer, nr_pages, cpu);
 	if (!buffer->buffers[cpu])
@@ -1593,7 +1646,11 @@ rb_remove_pages(struct ring_buffer_per_cpu *cpu_buffer, unsigned long nr_pages)
 		 * We have already removed references to this list item, just
 		 * free up the buffer_page and its page
 		 */
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+		free_buffer_page_cpu(to_remove_page, cpu_buffer->cpu, cpu_buffer->persist);
+#else		
 		free_buffer_page(to_remove_page);
+#endif		
 		nr_removed--;
 
 	} while (to_remove_page != last_page);
@@ -1674,7 +1731,11 @@ rb_insert_pages(struct ring_buffer_per_cpu *cpu_buffer)
 		list_for_each_entry_safe(bpage, tmp, &cpu_buffer->new_pages,
 					 list) {
 			list_del_init(&bpage->list);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+			free_buffer_page_cpu(bpage, cpu_buffer->cpu, cpu_buffer->persist);
+#else		
 			free_buffer_page(bpage);
+#endif			
 		}
 	}
 	return success;
@@ -1701,6 +1762,62 @@ static void update_pages_handler(struct work_struct *work)
 	rb_update_pages(cpu_buffer);
 	complete(&cpu_buffer->update_done);
 }
+
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+extern bool is_ramtrace_available(void);
+extern int init_ramtrace_pages(int, const char *, int);
+int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tracer_name, int clock_id)
+{
+	struct ring_buffer_per_cpu *cpu_buffer;
+	int cpu;
+	int online_cpu = 0;
+	unsigned long flags;
+
+	if (!is_ramtrace_available())
+		return 0;
+	for_each_buffer_cpu(buffer, cpu)
+		online_cpu++;
+        init_ramtrace_pages(online_cpu, tracer_name, clock_id);	
+	ring_buffer_record_disable(buffer);
+
+	for_each_buffer_cpu(buffer, cpu) 
+	{
+		struct list_head *head;
+		struct buffer_page *bpage, *tmp;
+
+		cpu_buffer = buffer->buffers[cpu];
+		head = cpu_buffer->pages;
+		raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
+		arch_spin_lock(&cpu_buffer->lock);
+		printk(KERN_ALERT "after lock %d\n", cpu);
+		free_page((unsigned long)cpu_buffer->reader_page->page);
+		cpu_buffer->reader_page->page = page_address(ramtrace_alloc_page(cpu));
+		printk(KERN_ALERT "allocated reader page\n");
+		rb_head_page_deactivate(cpu_buffer);
+		if (head) 
+		{
+			list_for_each_entry_safe(bpage, tmp, head, list) 
+			{
+			free_page((unsigned long)bpage->page);
+			bpage->page = page_address(ramtrace_alloc_page(cpu));
+			}
+		}
+		bpage = list_entry(head, struct buffer_page, list);
+		free_page((unsigned long)bpage->page);
+		bpage->page = page_address(ramtrace_alloc_page(cpu));
+		cpu_buffer->persist = true;
+
+		rb_reset_cpu(cpu_buffer);
+
+		arch_spin_unlock(&cpu_buffer->lock);
+
+		raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
+
+	}
+	ring_buffer_record_enable(buffer);
+
+}
+#endif
 
 /**
  * ring_buffer_resize - resize the ring buffer
@@ -1766,8 +1883,14 @@ int ring_buffer_resize(struct ring_buffer *buffer, unsigned long size,
 			 * allocated without receiving ENOMEM
 			 */
 			INIT_LIST_HEAD(&cpu_buffer->new_pages);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+			if (__rb_allocate_pages(cpu_buffer->nr_pages_to_update,
+						&cpu_buffer->new_pages, cpu, 
+						cpu_buffer->persist)) {
+#else
 			if (__rb_allocate_pages(cpu_buffer->nr_pages_to_update,
 						&cpu_buffer->new_pages, cpu)) {
+#endif				
 				/* not enough memory for new pages */
 				err = -ENOMEM;
 				goto out_err;
@@ -1822,8 +1945,13 @@ int ring_buffer_resize(struct ring_buffer *buffer, unsigned long size,
 
 		INIT_LIST_HEAD(&cpu_buffer->new_pages);
 		if (cpu_buffer->nr_pages_to_update > 0 &&
-			__rb_allocate_pages(cpu_buffer->nr_pages_to_update,
+			__rb_allocate_pages(cpu_buffer->nr_pages_to_update,				
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+					    &cpu_buffer->new_pages, cpu_id, 
+					    cpu_buffer->persist)) {
+#else
 					    &cpu_buffer->new_pages, cpu_id)) {
+#endif			
 			err = -ENOMEM;
 			goto out_err;
 		}
@@ -1883,7 +2011,11 @@ int ring_buffer_resize(struct ring_buffer *buffer, unsigned long size,
 		list_for_each_entry_safe(bpage, tmp, &cpu_buffer->new_pages,
 					list) {
 			list_del_init(&bpage->list);
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+			free_buffer_page_cpu(bpage, cpu, cpu_buffer->persist);
+#else		
 			free_buffer_page(bpage);
+#endif			
 		}
 	}
 	mutex_unlock(&buffer->mutex);
@@ -4615,6 +4747,11 @@ void *ring_buffer_alloc_read_page(struct ring_buffer *buffer, int cpu)
 	if (bpage)
 		goto out;
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
+	if (cpu_buffer->persist)
+		page = ramtrace_alloc_page(cpu);
+	else
+#endif		
 	page = alloc_pages_node(cpu_to_node(cpu),
 				GFP_KERNEL | __GFP_NORETRY, 0);
 	if (!page)
@@ -4866,7 +5003,7 @@ EXPORT_SYMBOL_GPL(ring_buffer_read_page);
  * If we were to free the buffer, then the user would lose any trace that was in
  * the buffer.
  */
-int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
+inline int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
 {
 	struct ring_buffer *buffer;
 	long nr_pages_same;
@@ -4901,6 +5038,7 @@ int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
 	}
 	smp_wmb();
 	cpumask_set_cpu(cpu, buffer->cpumask);
+	printk(KERN_ERR "trace_rb_cpu_prepare called for %d %s\n", cpu, __func__);
 	return 0;
 }
 

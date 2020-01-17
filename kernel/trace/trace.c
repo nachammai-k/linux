@@ -48,6 +48,7 @@
 #include <linux/fsnotify.h>
 #include <linux/irq_work.h>
 #include <linux/workqueue.h>
+#include <linux/ramtrace.h>
 
 #include "trace.h"
 #include "trace_output.h"
@@ -265,7 +266,8 @@ unsigned long long ns2usecs(u64 nsec)
 
 /* trace_flags that are default zero for instances */
 #define ZEROED_TRACE_FLAGS \
-	(TRACE_ITER_EVENT_FORK | TRACE_ITER_FUNC_FORK)
+	(TRACE_ITER_EVENT_FORK | TRACE_ITER_FUNC_FORK |			\
+	 TRACE_ITER_PERSIST)
 
 /*
  * The global_trace is the descriptor that holds the top-level tracing
@@ -1264,6 +1266,7 @@ void tracer_tracing_off(struct trace_array *tr)
 	tr->buffer_disabled = 1;
 	/* Make the flag seen by readers */
 	smp_wmb();
+	//ramtrace_dump();
 }
 
 /**
@@ -4733,8 +4736,14 @@ int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled)
 		trace_printk_control(enabled);
 	}
 
+#ifdef CONFIG_TRACE_EVENTS_TO_PSTORE	
+	if (mask == TRACE_ITER_PERSIST)
+		ring_buffer_use_persistent_memory(tr->trace_buffer.buffer, tr->current_trace->name, tr->clock_id);
+#endif	
+
 	return 0;
 }
+
 
 static int trace_set_options(struct trace_array *tr, char *option)
 {
