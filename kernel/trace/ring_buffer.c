@@ -1777,9 +1777,13 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 		return 0;
 	for_each_buffer_cpu(buffer, cpu)
 		online_cpu++;
-        init_ramtrace_pages(online_cpu, tracer_name, clock_id);	
+        if (!init_ramtrace_pages(online_cpu, tracer_name, clock_id))
+		return 0;	
 	ring_buffer_record_disable(buffer);
 
+	/* prevent another thread from changing buffer sizes */
+	mutex_lock(&buffer->mutex);
+	
 	for_each_buffer_cpu(buffer, cpu) 
 	{
 		struct list_head *head;
@@ -1789,7 +1793,6 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 		head = cpu_buffer->pages;
 		raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
 		arch_spin_lock(&cpu_buffer->lock);
-		printk(KERN_ALERT "after lock %d\n", cpu);
 		free_page((unsigned long)cpu_buffer->reader_page->page);
 		cpu_buffer->reader_page->page = page_address(ramtrace_alloc_page(cpu));
 		printk(KERN_ALERT "allocated reader page\n");
@@ -1800,6 +1803,7 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 			{
 			free_page((unsigned long)bpage->page);
 			bpage->page = page_address(ramtrace_alloc_page(cpu));
+			/* TODO - handle page allocation error */
 			}
 		}
 		bpage = list_entry(head, struct buffer_page, list);
@@ -1814,7 +1818,11 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 		raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
 
 	}
+
+	mutex_unlock(&buffer->mutex);
+
 	ring_buffer_record_enable(buffer);
+	return 1;
 
 }
 #endif
