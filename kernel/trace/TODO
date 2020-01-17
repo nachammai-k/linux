@@ -1,0 +1,6 @@
+Multiple bitmap pages to track allocated pages - WIP
+Error handling when there is not enough memory
+switching from persist to nopersist
+CPU hotplug
+Testing ramtrace_free_page
+Coding format / style check
