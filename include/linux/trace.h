@@ -21,6 +21,13 @@ struct trace_export {
 	void (*write)(struct trace_export *, const void *, unsigned int);
 };
 
+struct tr_persistent_info {
+	char *tracer_name;
+	int trace_clock;
+	unsigned int nr_cpus;
+	struct list_head *data_pages;
+};
+
 int register_ftrace_export(struct trace_export *export);
 int unregister_ftrace_export(struct trace_export *export);
 

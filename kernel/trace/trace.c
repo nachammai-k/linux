@@ -1266,7 +1266,7 @@ void tracer_tracing_off(struct trace_array *tr)
 	tr->buffer_disabled = 1;
 	/* Make the flag seen by readers */
 	smp_wmb();
-	//ramtrace_dump();
+	ramtrace_dump();
 }
 
 /**
@@ -4738,7 +4738,13 @@ int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled)
 
 #ifdef CONFIG_TRACE_EVENTS_TO_PSTORE	
 	if (mask == TRACE_ITER_PERSIST)
-		ring_buffer_use_persistent_memory(tr->trace_buffer.buffer, tr->current_trace->name, tr->clock_id);
+	{
+		if (enabled)
+			ring_buffer_use_persistent_memory(tr->trace_buffer.buffer, 
+					tr->current_trace->name, tr->clock_id);
+		//else
+		//	ring_buffer_use_nonpersistent_memory(tr->trace_buffer.buffer);
+	}
 #endif	
 
 	return 0;

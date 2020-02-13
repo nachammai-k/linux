@@ -1,18 +1,14 @@
+#include <linux/ring_buffer.h>
 #include <linux/kernel.h>
-#include <linux/list.h>
 #include <linux/err.h>
 #include <linux/spinlock.h>
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/pstore.h>
-#include <linux/mm.h>
-#include <linux/io.h>
-#include <linux/ioport.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/compiler.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
 #include <linux/ramtrace.h>
 #include <generated/utsrelease.h>
 static unsigned long long mem_address;
@@ -38,8 +34,10 @@ struct ramtrace_context {
 	struct ramtrace_freelist *freelist;
 	struct page *metadata;
 	struct page **bitmap_pages;
+	struct tr_persistent_info *persist_info;
 	void *base_address;
-	int k, cpu;
+	int num_bitmap_per_cpu, cpu;
+	int allocated;
 };
 
 static struct ramtrace_context trace_ctx = {
@@ -57,18 +55,36 @@ bool is_ramtrace_available(void)
 void ramtrace_dump_bitmap(unsigned long long *bitmap_page)
 {
 	int j;
+	int count = 0;
+	unsigned long long *time_stamp = (unsigned long long *)(trace_ctx.base_address + (354 * PAGE_SIZE));
 	for(j = 0; j < PAGE_SIZE/sizeof(long long); j=j+4)
-		printk(KERN_ERR "ramtrace %px : %llx %llx %llx %llx\n", bitmap_page + j, bitmap_page[j], bitmap_page[j+1], bitmap_page[j+2], bitmap_page[j+3]);
+		if (bitmap_page[j] || bitmap_page[j + 1] || bitmap_page[j+2] || bitmap_page[j+3])
+			printk(KERN_ERR "ramtrace %px : %llx %llx %llx %llx\n", bitmap_page + j, bitmap_page[j], bitmap_page[j+1], bitmap_page[j+2], bitmap_page[j+3]);
+
+	for(j = 0; j < PAGE_SIZE/sizeof(long long); j++)
+	{
+		unsigned long long k = bitmap_page[j];
+		while(k)
+		{
+			count += k & 1;
+			k = k >> 1;
+		}
+	}
+	printk(KERN_ERR "pages allocated %d \n", count);
+	printk(KERN_ERR "first timestamp %llu \n", *time_stamp); 
 }
 
 void ramtrace_dump(void)
 {
 	int i;
 	printk(KERN_ERR "base_address %px\n", trace_ctx.base_address);
-	for (i = 0; i < trace_ctx.cpu; i++)
+	for (i = 0; i < trace_ctx.cpu * trace_ctx.num_bitmap_per_cpu ; i++)
 	{
-		printk(KERN_ERR "Dumping bitmap cpu %d\n", i);
+	
+		printk(KERN_ERR "Dumping bitmap  %d\n", i);
+
 		ramtrace_dump_bitmap((unsigned long long *)page_address(trace_ctx.bitmap_pages[i]));
+
 	}
 }
 
@@ -103,13 +119,25 @@ static void ramtrace_write_int(int **buffer, int n)
 	(*buffer)++;
 }
 
-int init_ramtrace_pages(int cpu, const char *tracer, int trace_clock)
+int init_ramtrace_pages(int cpu, unsigned long npages, const char *tracer, int trace_clock)
 {
 	const char kernel_version[] = UTS_RELEASE;
 	struct ramtrace_freelist *freelist_node;
 	void *metapage;
 	unsigned long flags;
+	int n_bitmap = 0;
+	int ramtrace_pages;
 
+	ramtrace_pages = (trace_ctx.size >> PAGE_SHIFT) - 1;
+	printk(KERN_ALERT "ramtrace %d npages %lu\n", ramtrace_pages, npages);
+	if (ramtrace_pages < npages)
+		return 0;
+	while ((ramtrace_pages - cpu) >= 0)
+	{
+		ramtrace_pages -= ((PAGE_SIZE << 3) + cpu);
+		n_bitmap++;
+	}
+	printk(KERN_ALERT "n_bitmap : %d\n", n_bitmap);
 	spin_lock_irqsave(&trace_ctx.lock, flags);
 	freelist_node = list_next_entry(trace_ctx.freelist, list);
 	metapage = page_address(freelist_node->page);
@@ -119,14 +147,16 @@ int init_ramtrace_pages(int cpu, const char *tracer, int trace_clock)
 	trace_ctx.metadata = metapage;
 	ramtrace_write_int((int **)&metapage, cpu);
 	ramtrace_write_int((int **)&metapage, trace_clock);
-	ramtrace_write_int((int **)&metapage, 1);
+	ramtrace_write_int((int **)&metapage, n_bitmap);
 	sprintf(metapage, "%s", kernel_version);
 	metapage += strlen(kernel_version) +1;
 	sprintf(metapage, "%s", tracer);
 
 	kfree(freelist_node);
 	trace_ctx.cpu = cpu;
-	ramtrace_init_bitmap(cpu * 1);
+	trace_ctx.num_bitmap_per_cpu = n_bitmap;
+	trace_ctx.allocated=0;
+	ramtrace_init_bitmap(cpu * n_bitmap);
 	return 1;
 }
 
@@ -156,8 +186,9 @@ struct page* ramtrace_alloc_page(int cpu)
 		struct ramtrace_freelist *freelist_node;
 		char *bitmap_page;
 		void *address;
-		int index;
+		unsigned long page_num;
 		unsigned long flags;
+		int index, bitmap_page_index;
 		
                 spin_lock_irqsave(&trace_ctx.lock, flags);
 		freelist_node = list_next_entry(freelist, list);
@@ -167,12 +198,16 @@ struct page* ramtrace_alloc_page(int cpu)
 		page = freelist_node->page;
 		address = page_address(page);
 		memset(address, 0, PAGE_SIZE);
-		bitmap_page = (char *)page_address(trace_ctx.bitmap_pages[cpu]);
-                index = (address - trace_ctx.base_address) >> PAGE_SHIFT;
+                page_num = (address - trace_ctx.base_address) >> PAGE_SHIFT;
+		bitmap_page_index = page_num >> (PAGE_SHIFT + 3);
+		bitmap_page = (char *)page_address(trace_ctx.bitmap_pages[trace_ctx.num_bitmap_per_cpu * cpu + bitmap_page_index]);
+	        index = page_num - (bitmap_page_index << (PAGE_SHIFT + 3));		
 		ramtrace_set_bit(bitmap_page, index);
-		printk(KERN_ERR "allocating page ramtrace %px\n", address);
+		trace_ctx.allocated++;
 
 	}
+	else
+		printk(KERN_ERR "empty page %d \n", trace_ctx.allocated);
 	return page;
 
 }
@@ -180,9 +215,17 @@ struct page* ramtrace_alloc_page(int cpu)
 void ramtrace_free_page(void *page_address, int cpu)
 {
 	struct page *page = virt_to_page(page_address);
-	int index = (page_address - trace_ctx.base_address) >> PAGE_SHIFT;
-	void *metapage = trace_ctx.bitmap_pages[cpu];
-printk(KERN_ERR "free page cpu %d index %d", cpu, index);
+	void *metapage;
+       int index;	
+
+
+        unsigned long page_num = (page_address - trace_ctx.base_address) >> PAGE_SHIFT;
+	int bitmap_page_index = page_num >> (PAGE_SHIFT + 3);
+	if (page_address == NULL)
+		return;
+	metapage = (char *)page_address(trace_ctx.bitmap_pages[trace_ctx.num_bitmap_per_cpu * cpu + bitmap_page_index]);
+	index = page_num - (bitmap_page_index << (PAGE_SHIFT + 3));		
+//printk(KERN_ERR "free page cpu %d index %d page_num %d page_address %px base address %px", cpu, index, page_num, page_address, trace_ctx.base_address);
 	if (ramtrace_is_allocated(metapage, index))
 	{
 	        struct ramtrace_freelist *freelist_node =  	
@@ -194,6 +237,7 @@ printk(KERN_ERR "free page cpu %d index %d", cpu, index);
 		spin_unlock_irqrestore(&trace_ctx.lock, flags);
 
 		ramtrace_reset_bit(metapage, index);
+		trace_ctx.allocated--;
 	}
 
 }
@@ -220,6 +264,129 @@ static int ramtrace_parse_dt(struct platform_device *pdev,
 	return 0;
 }
 
+static int ramtrace_read_int(int **buffer)
+{
+	int data = **buffer;
+	(*buffer)++;
+	return data;
+}
+
+static char* ramtrace_read_string(char **buffer)
+{
+	int len = strlen(*buffer) + 1;
+	if (len > 1)
+	{
+		char *s = kmalloc(len, GFP_KERNEL);
+		strncpy(s, *buffer, len);
+		*buffer = (*buffer) + len;
+		return s;
+	}
+	return NULL;
+
+}
+
+static struct list_head* ramtrace_read_bitmap_per_cpu(int n_bitmap, unsigned long long *bitmap, void *first_page)
+{
+	int j, k;
+	struct list_head *pages = kmalloc(sizeof(struct list_head), GFP_KERNEL);
+	INIT_LIST_HEAD(pages);
+	
+	for(k = 0; k <  n_bitmap; k++)
+	{
+	bitmap = (void *)(bitmap) + PAGE_SIZE * k;		
+	for(j = 0; j < PAGE_SIZE/sizeof(long long); j++)
+	{
+		struct ramtrace_page_list *list_page;
+		unsigned long long k = bitmap[j];
+		int count = 0;
+		while (k)
+		{
+			if (k & 1)
+			{
+				list_page = kzalloc(sizeof(struct ramtrace_page_list), GFP_KERNEL);
+				list_page->page = (first_page + (j * sizeof(long long) * 8 + count) * PAGE_SIZE);
+				list_add_tail(&list_page->list, pages);
+			}
+			count++;
+			k = k >> 1;
+		}
+
+	}
+	}
+	return pages;
+}
+
+static struct list_head* ramtrace_read_bitmap(int n_cpu, int n_bitmap)
+{
+	int i;
+        void *base_address = (trace_ctx.vaddr + PAGE_SIZE) + (n_cpu * n_bitmap * PAGE_SIZE);
+	struct list_head *per_cpu_list;	
+	for (i = 0; i < n_cpu; i++)
+	{
+		per_cpu_list = ramtrace_read_bitmap_per_cpu(n_bitmap, trace_ctx.vaddr + PAGE_SIZE + i * n_bitmap * PAGE_SIZE, base_address);
+		if (per_cpu_list)
+			ring_buffer_order_pages(per_cpu_list);
+
+	}
+	return per_cpu_list;
+
+}
+
+struct tr_persistent_info* tr_info_from_persistent(void)
+{
+	return trace_ctx.persist_info;
+}	
+
+
+static void print_persist(void)
+{
+	if (trace_ctx.persist_info)
+	{
+		struct tr_persistent_info *tr = trace_ctx.persist_info;
+		struct ramtrace_page_list *data_page;
+		struct list_head *pages = tr->data_pages;
+
+		pr_info("tracer %s cpu %d trace_clock %d \n", tr->tracer_name, tr->nr_cpus, tr->trace_clock);
+
+
+		list_for_each_entry(data_page, pages, list)
+		{
+			u64 *ts = (u64 *)(data_page->page);
+			printk(KERN_INFO "timestamp: %llu\n", *ts);
+		}
+
+	}
+
+}
+
+static void ramtrace_read_pages(void)
+{
+	void *metapage = trace_ctx.vaddr;
+
+
+	int n_cpu = ramtrace_read_int((int **)&metapage);
+	int trace_clock = ramtrace_read_int((int **)&metapage);
+	int n_bitmap = ramtrace_read_int((int **)&metapage);
+	char *kernel_version = ramtrace_read_string((char **)&metapage);
+	char *tracer = ramtrace_read_string((char **)&metapage);
+	struct list_head *ordered_pages;
+	struct tr_persistent_info *persist = NULL;
+
+	if (kernel_version && tracer)
+	{
+		pr_info("kernel_version %s tracer %s %d %d \n", kernel_version, tracer, n_cpu, n_bitmap);
+	
+		ordered_pages = ramtrace_read_bitmap(n_cpu, n_bitmap);
+		persist = kmalloc(sizeof(struct tr_persistent_info), GFP_KERNEL);
+	
+		persist->tracer_name = tracer;
+		persist->trace_clock = trace_clock;
+		persist->nr_cpus = n_cpu;	
+		persist->data_pages = ordered_pages;
+	}
+	trace_ctx.persist_info = persist;
+	print_persist();
+}
 
 static int ramtrace_init_prz(struct ramtrace_context *ctx)
 {
@@ -230,7 +397,7 @@ static int ramtrace_init_prz(struct ramtrace_context *ctx)
 	unsigned int i;
 	struct ramtrace_freelist *freelist;
 
-	page_count = DIV_ROUND_UP(ctx->phys_addr, PAGE_SIZE);
+	page_count = DIV_ROUND_UP(ctx->size, PAGE_SIZE);
 
 	prot = pgprot_noncached(PAGE_KERNEL);
 
@@ -252,6 +419,7 @@ static int ramtrace_init_prz(struct ramtrace_context *ctx)
 	}
         spin_lock_init(&ctx->lock); 
 	ctx->vaddr = vmap(pages, page_count, VM_MAP, prot);
+	ramtrace_read_pages();
 	kfree(pages);
 	return 1;
 }
@@ -359,10 +527,6 @@ static void __init ramtrace_register_dummy(void)
 	pdata.mem_size = mem_size;
 	pdata.mem_address = mem_address;
 
-	/*
-	 * For backwards compatibility ramoops.ecc=1 means 16 bytes ECC
-	 * (using 1 byte for ECC isn't much of use anyway).
-	 */
 
 	dummy = platform_device_register_data(NULL, "ramtrace", -1,
 			&pdata, sizeof(pdata));

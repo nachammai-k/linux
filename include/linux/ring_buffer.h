@@ -213,4 +213,6 @@ int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node);
 #define trace_rb_cpu_prepare	NULL
 #endif
 
+void ring_buffer_order_pages(struct list_head *pages);
+
 #endif /* _LINUX_RING_BUFFER_H */

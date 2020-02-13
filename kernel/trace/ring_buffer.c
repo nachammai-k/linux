@@ -28,6 +28,8 @@
 #include <linux/ramtrace.h>
 #include <asm/local.h>
 
+#include "trace.h"
+
 static void update_pages_handler(struct work_struct *work);
 
 /*
@@ -359,7 +361,7 @@ static void free_buffer_page_cpu(struct buffer_page *bpage, int cpu, bool persis
 {
 	if (persist)
 	{
-		ramtrace_free_page((unsigned long)bpage->page, cpu);
+		ramtrace_free_page(bpage->page, cpu);
 		kfree(bpage);
 	}
 	else
@@ -1765,19 +1767,24 @@ static void update_pages_handler(struct work_struct *work)
 
 #ifdef CONFIG_TRACE_EVENTS_TO_PSTORE
 extern bool is_ramtrace_available(void);
-extern int init_ramtrace_pages(int, const char *, int);
+extern int init_ramtrace_pages(int, int, const char *, int);
+static int test_ringbuffer(struct ring_buffer *buffer);
+
 int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tracer_name, int clock_id)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	int cpu;
 	int online_cpu = 0;
+	int nr_pages = 0;
 	unsigned long flags;
-
 	if (!is_ramtrace_available())
 		return 0;
 	for_each_buffer_cpu(buffer, cpu)
+	{
 		online_cpu++;
-        if (!init_ramtrace_pages(online_cpu, tracer_name, clock_id))
+		nr_pages += buffer->buffers[cpu]->nr_pages;
+	}
+        if (!init_ramtrace_pages(online_cpu, nr_pages, tracer_name, clock_id))
 		return 0;	
 	ring_buffer_record_disable(buffer);
 
@@ -1795,7 +1802,6 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 		arch_spin_lock(&cpu_buffer->lock);
 		free_page((unsigned long)cpu_buffer->reader_page->page);
 		cpu_buffer->reader_page->page = page_address(ramtrace_alloc_page(cpu));
-		printk(KERN_ALERT "allocated reader page\n");
 		rb_head_page_deactivate(cpu_buffer);
 		if (head) 
 		{
@@ -1822,9 +1828,76 @@ int ring_buffer_use_persistent_memory(struct ring_buffer *buffer, const char *tr
 	mutex_unlock(&buffer->mutex);
 
 	ring_buffer_record_enable(buffer);
+	//test_ringbuffer(buffer);
 	return 1;
 
 }
+
+
+int ring_buffer_use_nonpersistent_memory(struct ring_buffer *buffer, const char *tracer_name, int clock_id)
+{
+	struct ring_buffer_per_cpu *cpu_buffer;
+	int cpu;
+	int online_cpu = 0;
+	int nr_pages = 0;
+	unsigned long flags;
+#if 0
+	ring_buffer_record_disable(buffer);
+
+	/* prevent another thread from changing buffer sizes */
+	mutex_lock(&buffer->mutex);
+	
+	for_each_buffer_cpu(buffer, cpu) 
+	{
+		if (cpu_buffer->persist)
+		{
+			struct list_head *head;
+			struct buffer_page *bpage, *tmp;
+
+			cpu_buffer = buffer->buffers[cpu];
+			head = cpu_buffer->pages;
+			raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
+			arch_spin_lock(&cpu_buffer->lock);
+			free_buffer_page_cpu((unsigned long)cpu_buffer->reader_page->page, cpu, true);
+					
+			page = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL, 0);
+			if(!page)
+				goto fail_reader;
+			cpu_buffer->reader_page->page = page_address(page);
+			rb_head_page_deactivate(cpu_buffer);
+			if (head) 
+			{
+				list_for_each_entry_safe(bpage, tmp, head, list) 
+				{
+					free_buffer_page_cpu((unsigned long)bpage->page, cpu, true);
+					page = alloc_pages_node(cpu_to_node(cpu), GFP_KERNEL, 0);
+					if (!page)
+						goto failed;
+					bpage->page = page_address(page);
+					/* TODO - handle page allocation error */
+				}
+			}
+			bpage = list_entry(head, struct buffer_page, list);
+			free_buffer_page_cpu((unsigned long)bpage->page);
+			bpage->page = page_address(ramtrace_alloc_page(cpu));
+			cpu_buffer->persist = false;
+
+			rb_reset_cpu(cpu_buffer);
+
+			arch_spin_unlock(&cpu_buffer->lock);
+
+			raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
+		}
+
+	}
+
+	mutex_unlock(&buffer->mutex);
+
+	ring_buffer_record_enable(buffer);
+#endif
+	return 1;
+}
+
 #endif
 
 /**
@@ -3367,11 +3440,19 @@ void ring_buffer_record_off(struct ring_buffer *buffer)
 {
 	unsigned int rd;
 	unsigned int new_rd;
-
+int cpu;
 	do {
 		rd = atomic_read(&buffer->record_disabled);
 		new_rd = rd | RB_BUFFER_OFF;
 	} while (atomic_cmpxchg(&buffer->record_disabled, rd, new_rd) != rd);
+
+	for_each_buffer_cpu(buffer, cpu) {
+	struct ring_buffer_per_cpu *cpu_buffer = buffer->buffers[cpu];
+		unsigned long long t = ns2usecs(cpu_buffer->head_page->page->time_stamp);
+		unsigned long usec_rem = do_div(t, USEC_PER_SEC);
+		unsigned long secs = (unsigned long)t;
+		printk(KERN_ERR "ring_buffer head page  %5lu.%06lu %lu: %px", secs, usec_rem, cpu_buffer->head_page->page->time_stamp , cpu_buffer->head_page->page);
+	}
 }
 EXPORT_SYMBOL_GPL(ring_buffer_record_off);
 
@@ -4502,7 +4583,6 @@ rb_reset_cpu(struct ring_buffer_per_cpu *cpu_buffer)
 
 	cpu_buffer->tail_page = cpu_buffer->head_page;
 	cpu_buffer->commit_page = cpu_buffer->head_page;
-
 	INIT_LIST_HEAD(&cpu_buffer->reader_page->list);
 	INIT_LIST_HEAD(&cpu_buffer->new_pages);
 	local_set(&cpu_buffer->reader_page->write, 0);
@@ -5050,7 +5130,70 @@ inline int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
 	return 0;
 }
 
-#ifdef CONFIG_RING_BUFFER_STARTUP_TEST
+void ring_buffer_order_pages(struct list_head *pages)
+{
+	struct ramtrace_page_list *temp, *data_page, *min_page;
+	u64 min_ts = 0;
+	u64 prev_ts;
+
+	min_page = NULL;
+	list_for_each_entry_safe(data_page, temp, pages, list)
+	{
+		u64 ts = data_page->page->time_stamp;
+		if (ts == 0)
+		{
+			list_del(&data_page->list);
+			kfree(data_page);
+		}
+		else
+		{
+			if (ts < min_ts || min_ts == 0)
+			{
+				min_ts = ts;
+				min_page = data_page;
+			}
+		}
+	}
+
+	if (min_ts)
+	{	
+		list_move(pages, min_page->list.prev);
+		prev_ts = min_ts;
+		data_page = min_page;
+		list_for_each_entry_from(data_page, pages, list)
+		{
+			u64 ts = data_page->page->time_stamp;
+			if(ts >= prev_ts)
+				prev_ts = ts;
+			else
+			{	
+				struct ramtrace_page_list *node = list_entry(min_page->list.next, struct ramtrace_page_list, list);
+				list_for_each_entry_from(node, &data_page->list, list)
+				{
+					if (node->page->time_stamp > ts)
+					{
+						list_del(&data_page->list);	
+						list_add_tail(&data_page->list, &node->list);
+						break;
+					}
+					       
+
+				}
+			}
+
+
+		}	
+#if 0
+	list_for_each_entry(data_page, pages, list)
+	{
+		u64 ts = data_page->page->time_stamp;
+		printk(KERN_INFO "timestamp: %llu\n", ts);
+	}
+#endif
+	}
+		
+}
+
 /*
  * This is a basic integrity check of the ring buffer.
  * Late in the boot cycle this test will run when configured in.
@@ -5066,7 +5209,7 @@ inline int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
  * ring buffer should happen that's not expected, a big warning
  * is displayed and all ring buffers are disabled.
  */
-static struct task_struct *rb_threads[NR_CPUS] __initdata;
+static struct task_struct *rb_threads[NR_CPUS];
 
 struct rb_test_data {
 	struct ring_buffer	*buffer;
@@ -5086,24 +5229,24 @@ struct rb_test_data {
 	int			cnt;
 };
 
-static struct rb_test_data rb_data[NR_CPUS] __initdata;
+static struct rb_test_data rb_data[NR_CPUS] ;
 
 /* 1 meg per cpu */
 #define RB_TEST_BUFFER_SIZE	1048576
 
-static char rb_string[] __initdata =
+static char rb_string[]  =
 	"abcdefghijklmnopqrstuvwxyz1234567890!@#$%^&*()?+\\"
 	"?+|:';\",.<>/?abcdefghijklmnopqrstuvwxyz1234567890"
 	"!@#$%^&*()?+\\?+|:';\",.<>/?abcdefghijklmnopqrstuv";
 
-static bool rb_test_started __initdata;
+static bool rb_test_started;
 
 struct rb_item {
 	int size;
 	char str[];
 };
 
-static __init int rb_write_something(struct rb_test_data *data, bool nested)
+static int rb_write_something(struct rb_test_data *data, bool nested)
 {
 	struct ring_buffer_event *event;
 	struct rb_item *item;
@@ -5170,7 +5313,7 @@ static __init int rb_write_something(struct rb_test_data *data, bool nested)
 	return 0;
 }
 
-static __init int rb_test(void *arg)
+static int rb_test(void *arg)
 {
 	struct rb_test_data *data = arg;
 
@@ -5186,7 +5329,7 @@ static __init int rb_test(void *arg)
 	return 0;
 }
 
-static __init void rb_ipi(void *ignore)
+static void rb_ipi(void *ignore)
 {
 	struct rb_test_data *data;
 	int cpu = smp_processor_id();
@@ -5195,7 +5338,7 @@ static __init void rb_ipi(void *ignore)
 	rb_write_something(data, true);
 }
 
-static __init int rb_hammer_test(void *arg)
+static int rb_hammer_test(void *arg)
 {
 	while (!kthread_should_stop()) {
 
@@ -5208,10 +5351,10 @@ static __init int rb_hammer_test(void *arg)
 	return 0;
 }
 
-static __init int test_ringbuffer(void)
+static int test_ringbuffer(struct ring_buffer *buffer)
 {
 	struct task_struct *rb_hammer;
-	struct ring_buffer *buffer;
+	//struct ring_buffer *buffer;
 	int cpu;
 	int ret = 0;
 
@@ -5222,14 +5365,14 @@ static __init int test_ringbuffer(void)
 
 	pr_info("Running ring buffer tests...\n");
 
-	buffer = ring_buffer_alloc(RB_TEST_BUFFER_SIZE, RB_FL_OVERWRITE);
+	//buffer = ring_buffer_alloc(RB_TEST_BUFFER_SIZE, RB_FL_OVERWRITE);
 	if (WARN_ON(!buffer))
 		return 0;
 
 	/* Disable buffer so that threads can't write to it yet */
 	ring_buffer_record_off(buffer);
 
-	for_each_online_cpu(cpu) {
+	for_each_tracing_cpu(cpu) {
 		rb_data[cpu].buffer = buffer;
 		rb_data[cpu].cpu = cpu;
 		rb_data[cpu].cnt = cpu;
@@ -5273,7 +5416,7 @@ static __init int test_ringbuffer(void)
 	kthread_stop(rb_hammer);
 
  out_free:
-	for_each_online_cpu(cpu) {
+	for_each_tracing_cpu(cpu) {
 		if (!rb_threads[cpu])
 			break;
 		kthread_stop(rb_threads[cpu]);
@@ -5285,7 +5428,7 @@ static __init int test_ringbuffer(void)
 
 	/* Report! */
 	pr_info("finished\n");
-	for_each_online_cpu(cpu) {
+	for_each_tracing_cpu(cpu) {
 		struct ring_buffer_event *event;
 		struct rb_test_data *data = &rb_data[cpu];
 		struct rb_item *item;
@@ -5319,8 +5462,8 @@ static __init int test_ringbuffer(void)
 		pr_info("       biggest event:    %d\n", big_event_size);
 		pr_info("      smallest event:    %d\n", small_event_size);
 
-		if (RB_WARN_ON(buffer, total_dropped))
-			break;
+	//	if (RB_WARN_ON(buffer, total_dropped))
+	//		break;
 
 		ret = 0;
 
@@ -5369,5 +5512,4 @@ static __init int test_ringbuffer(void)
 	return 0;
 }
 
-late_initcall(test_ringbuffer);
-#endif /* CONFIG_RING_BUFFER_STARTUP_TEST */
+//late_initcall(test_ringbuffer);
